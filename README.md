@@ -52,6 +52,24 @@ voiceclone --engine espeak
 
 All options: `voiceclone --help`.
 
+## Speaking style from a second clip
+
+StyleTTS2's style vector has two halves: **timbre** (whose voice it is) and
+**prosody** (pacing, intonation, energy). To keep your voice but talk like a
+different recording, put that recording in the same private repo and pass it
+as the style reference. Timbre comes from `--voice-ref-file`, prosody from
+`--style-ref-file`:
+
+```bash
+voiceclone --engine styletts2 --style-ref-file style_reference.wav
+# or: export VOICE_STYLE_REF=style_reference.wav
+```
+
+`--beta` controls how closely the style is followed (0 = copy the style clip,
+1 = let the model invent prosody from the text); it defaults to 0 when a
+style clip is given. Add `--embedding-scale 1.5` for a more expressive read.
+A 15-30s clean, music-free clip works best.
+
 ## Python API
 
 ```python

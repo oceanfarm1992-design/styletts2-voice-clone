@@ -45,6 +45,17 @@ def main():
     ap.add_argument("--voice-repo-pat-env", default="VOICE_REPO_PAT",
                      help="Name of the env var holding a read-only GitHub PAT "
                           "scoped to --voice-ref-repo.")
+    ap.add_argument("--style-ref-file", default=os.environ.get("VOICE_STYLE_REF") or None,
+                     help="Clip in --voice-ref-repo whose speaking style (pacing, "
+                          "intonation, energy) the cloned voice should copy "
+                          "(falls back to the VOICE_STYLE_REF env var).")
+    ap.add_argument("--alpha", type=float, default=0.3,
+                     help="StyleTTS2 timbre: 0 = exactly the reference voice.")
+    ap.add_argument("--beta", type=float, default=None,
+                     help="StyleTTS2 prosody: 0 = copy the reference style, 1 = "
+                          "invent from text (default 0.0 with a style clip, else 0.7).")
+    ap.add_argument("--embedding-scale", type=float, default=1.0,
+                     help="StyleTTS2 expressiveness; higher = more emotional.")
     ap.add_argument("--voices-dir", default="voices")
     ap.add_argument("--openai-model", default="tts-1")
     args = ap.parse_args()
@@ -64,6 +75,10 @@ def main():
             voice_ref_repo=voice_ref_repo,
             voice_ref_file=args.voice_ref_file,
             voice_repo_pat_env=args.voice_repo_pat_env,
+            style_ref_file=args.style_ref_file,
+            styletts2_alpha=args.alpha,
+            styletts2_beta=args.beta,
+            styletts2_embedding_scale=args.embedding_scale,
             kokoro_voice=kokoro_voice,
             piper_voice=piper_voice,
             voices_dir=args.voices_dir,

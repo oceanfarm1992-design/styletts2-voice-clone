@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "styletts2-voice-clone"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reusable StyleTTS2 voice-cloning TTS chain (Kokoro/Piper/espeak fallbacks) for CI-driven video pipelines"
 readme = "README.md"
 license = { text = "MIT" }

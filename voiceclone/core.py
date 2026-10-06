@@ -41,7 +41,8 @@ except ImportError:
 _KOKORO_PIPELINE = None
 _KOKORO_LANG = None
 _STYLETTS2_MODEL = None
-_VOICE_REF_PATH = None
+_VOICE_REF_PATHS: dict = {}   # (repo, file) -> local cached path
+_STYLE_VECTORS: dict = {}     # (voice path, style path) -> spliced style tensor
 
 # HuggingFace raw file base for piper voices.
 # Path layout: <lang>/<lang_region>/<name>/<quality>/<voice>.onnx[.json]
@@ -58,6 +59,24 @@ HEADERS = {"User-Agent": "styletts2-voice-clone/0.1"}
 # more tokens per character than that budget assumes, overflowing the underlying
 # model's 512-token limit even within one "safe" chunk. Shrink it for headroom.
 STYLETTS2_CHUNK_CHARS = 250
+
+# Phoneme-level pronunciation fixes, applied after StyleTTS2's own phonemizer.
+# "GitHub" phonemizes to ɡˈɪthʌb, and the model stretches that /h/ into a ~0.5s
+# near-silent breath ("Git ... Hub"); dropping it gives the fast spoken "Git-ub".
+PHONEME_FIXES = {
+    "ɡˈɪthʌb": "ɡˈɪtʌb",
+}
+
+
+class _FixedPhonemizer:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def phonemize(self, text):
+        out = self.inner.phonemize(text)
+        for src, dst in PHONEME_FIXES.items():
+            out = out.replace(src, dst)
+        return out
 
 
 class AllEnginesFailedError(RuntimeError):
@@ -106,9 +125,9 @@ def _fetch_voice_reference(repo: str, file: str, pat: str, cache_path: str) -> s
     """Download the private reference voice clip at runtime via a fine-grained,
     read-only PAT scoped to a separate private repo. Never committed anywhere —
     the clip is personal biometric-ish data and this package is public."""
-    global _VOICE_REF_PATH
-    if _VOICE_REF_PATH and os.path.exists(_VOICE_REF_PATH):
-        return _VOICE_REF_PATH
+    cached = _VOICE_REF_PATHS.get((repo, file))
+    if cached and os.path.exists(cached):
+        return cached
     if not repo:
         raise RuntimeError(
             "No voice reference repo configured (pass voice_ref_repo= or set VOICE_REF_REPO)."
@@ -125,7 +144,7 @@ def _fetch_voice_reference(repo: str, file: str, pat: str, cache_path: str) -> s
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
     with open(cache_path, "wb") as f:
         f.write(resp.content)
-    _VOICE_REF_PATH = cache_path
+    _VOICE_REF_PATHS[(repo, file)] = cache_path
     return cache_path
 
 
@@ -153,17 +172,49 @@ def _get_styletts2_model():
 
         from styletts2.tts import StyleTTS2
         _STYLETTS2_MODEL = StyleTTS2()
+        _STYLETTS2_MODEL.phoneme_converter = _FixedPhonemizer(_STYLETTS2_MODEL.phoneme_converter)
     return _STYLETTS2_MODEL
+
+
+def _style_vector(model, voice_path: str, style_path: str | None):
+    """StyleTTS2's 256-dim style vector is [timbre (128) | prosody (128)]:
+    style_encoder -> who it sounds like, predictor_encoder -> how it is spoken
+    (pacing, intonation, energy). With a separate style clip, keep the timbre of
+    the voice sample and take the prosody from the style clip."""
+    key = (voice_path, style_path)
+    if key not in _STYLE_VECTORS:
+        voice = model.compute_style(voice_path)
+        if style_path:
+            import torch
+            style = model.compute_style(style_path)
+            voice = torch.cat([voice[:, :128], style[:, 128:]], dim=1)
+        _STYLE_VECTORS[key] = voice
+    return _STYLE_VECTORS[key]
 
 
 def run_styletts2(text: str, out_wav: str, voice_ref_repo: str | None,
                    voice_ref_file: str = "reference_voice.mp3",
                    pat_env: str = "VOICE_REPO_PAT",
-                   cache_path: str = "build/.voice_reference.mp3") -> None:
+                   cache_path: str = "build/.voice_reference.mp3",
+                   style_ref_file: str | None = None,
+                   alpha: float = 0.3,
+                   beta: float | None = None,
+                   embedding_scale: float = 1.0) -> None:
+    """beta = how much prosody the model invents from the text (1) vs. copies from
+    the reference (0). Defaults to StyleTTS2's 0.7, or 0.0 when a style clip is
+    given so its speaking style comes through fully."""
     pat = os.environ.get(pat_env, "").strip()
     ref_path = _fetch_voice_reference(voice_ref_repo, voice_ref_file, pat, cache_path)
+    style_path = None
+    if style_ref_file:
+        root, _ = os.path.splitext(cache_path)
+        style_cache = f"{root}.style{os.path.splitext(style_ref_file)[1] or '.wav'}"
+        style_path = _fetch_voice_reference(voice_ref_repo, style_ref_file, pat, style_cache)
+    if beta is None:
+        beta = 0.0 if style_path else 0.7
     model = _get_styletts2_model()
-    model.inference(text, target_voice_path=ref_path, output_wav_file=out_wav)
+    model.inference(text, output_wav_file=out_wav, ref_s=_style_vector(model, ref_path, style_path),
+                    alpha=alpha, beta=beta, embedding_scale=embedding_scale)
 
 
 # ----------------------------------------------------------------------------- Piper
@@ -219,6 +270,10 @@ def synthesize(
     voice_ref_file: str = "reference_voice.mp3",
     voice_repo_pat_env: str = "VOICE_REPO_PAT",
     voice_ref_cache: str = "build/.voice_reference.mp3",
+    style_ref_file: str | None = None,
+    styletts2_alpha: float = 0.3,
+    styletts2_beta: float | None = None,
+    styletts2_embedding_scale: float = 1.0,
     kokoro_voice: str = "am_fenrir",
     kokoro_lang: str = "a",
     piper_voice: str = "en_US-amy-medium",
@@ -236,6 +291,10 @@ def synthesize(
     missing binary, etc). Pass a specific engine name to skip the chain and
     use only that one. Raises AllEnginesFailedError only when every engine
     tried has failed.
+
+    style_ref_file (styletts2 only): a second clip in voice_ref_repo whose
+    speaking style (pacing, intonation, energy) is applied to the cloned voice;
+    the timbre still comes from voice_ref_file.
     """
     engines = [engine] if engine != "auto" else ["styletts2", "kokoro", "piper", "espeak"]
     os.makedirs(os.path.dirname(out_wav) or ".", exist_ok=True)
@@ -245,7 +304,8 @@ def synthesize(
         try:
             if eng == "styletts2":
                 run_styletts2(text, out_wav, voice_ref_repo, voice_ref_file,
-                              voice_repo_pat_env, voice_ref_cache)
+                              voice_repo_pat_env, voice_ref_cache, style_ref_file,
+                              styletts2_alpha, styletts2_beta, styletts2_embedding_scale)
             elif eng == "kokoro":
                 run_kokoro(text, out_wav, kokoro_voice, kokoro_lang)
             elif eng == "piper":
