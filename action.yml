@@ -49,6 +49,13 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq ffmpeg espeak-ng libsndfile1 >/dev/null
 
+    # hashFiles() only reads files inside the workspace (and errors on some
+    # checkouts), but this action may live outside it, so hash here instead.
+    - name: Dependency hash
+      id: deps
+      shell: bash
+      run: echo "hash=$(cat "$GITHUB_ACTION_PATH"/requirements/*.txt "$GITHUB_ACTION_PATH/setup_engines.sh" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
     # Built engine venvs + public model weights, never the private voice files.
     # Restoring the venvs saves ~1 min of installing per runner. The key pins
     # the exact Python build (venvs point at it) and the engine list.
@@ -59,7 +66,7 @@ runs:
           ~/.voiceclone/applio
           ~/.cache/huggingface
           ~/nltk_data
-        key: voiceclone-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ inputs.engines }}-${{ hashFiles(format('{0}/requirements/*.txt', github.action_path), format('{0}/setup_engines.sh', github.action_path)) }}
+        key: voiceclone-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ inputs.engines }}-${{ steps.deps.outputs.hash }}
         restore-keys: voiceclone-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ inputs.engines }}-
 
     - name: Build engine venvs
