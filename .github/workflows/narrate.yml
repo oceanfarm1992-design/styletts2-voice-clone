@@ -68,6 +68,17 @@ jobs:
     outputs:
       parts: ${{ steps.split.outputs.parts }}
     steps:
+      - name: Debug workflow refs
+        env:
+          A: ${{ github.job_workflow_sha }}
+          B: ${{ github.workflow_sha }}
+          C: ${{ github.workflow_ref }}
+          D: ${{ toJSON(job) }}
+        run: printf 'job_workflow_sha=%s
+workflow_sha=%s
+workflow_ref=%s
+job=%s
+' "$A" "$B" "$C" "$D"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
