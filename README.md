@@ -61,12 +61,17 @@ For example, an English-only pipeline can use `engines: styletts2 rvc`.
 
 ### Faster: narrate on several runners in parallel
 
-Tamil (IndicF5) is slow on CPU: about 3.5 minutes per sentence on a 4-core
-runner. The reusable `narrate` workflow splits the script at sentence
-boundaries and narrates each part on its own runner. Then it joins the parts
-and uploads the result as one artifact. Every sentence is generated exactly as
-in a single job, so quality is identical. Wall time drops roughly by `parts`.
-Each runner adds about 3-5 minutes of setup.
+Tamil (IndicF5) is slow on CPU, so the reusable `narrate` workflow splits the
+script and narrates the pieces on parallel runners, then joins them into one
+artifact. **The number of runners follows the script**: one per sentence,
+sentences shorter than ~3 s of speech grouped together, and at most
+`max-parts` runners (default 20, the GitHub Free limit for jobs running at
+once). Engine environments and models are cached, so the first run is about
+a minute slower than the ones after it.
+
+Measured on GitHub runners, 53 s Tamil comedy story (8 lines): 16 runners,
+**4 min 45 s**. The same story took 8 min on 4 fixed runners, and the
+16-runner version sounded better.
 
 ```yaml
 jobs:
