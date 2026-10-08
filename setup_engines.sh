@@ -24,11 +24,15 @@ mkdir -p "$HOME_DIR/venvs"
 setup_venv() {
   local engine="$1" venv="$HOME_DIR/venvs/$1"
   echo "::group::voiceclone: $engine venv"
-  [ -x "$venv/bin/python" ] || uv venv -q -p "$PYTHON" "$venv"
+  # A venv restored from the Actions cache is reused; rebuild it if its
+  # interpreter no longer runs (e.g. a different Python build).
+  "$venv/bin/python" -c "" 2>/dev/null || { rm -rf "$venv"; uv venv -q -p "$PYTHON" "$venv"; }
   # unsafe-best-match: take torch from the CPU index, everything else from PyPI.
   uv pip install -q -p "$venv/bin/python" --index-strategy unsafe-best-match \
     --extra-index-url "$TORCH_INDEX" -r "$HERE/requirements/$engine.txt"
-  uv pip install -q -p "$venv/bin/python" --no-deps "$HERE"
+  # Always refresh this package itself: a cached venv may hold an older copy
+  # with the same version number.
+  uv pip install -q -p "$venv/bin/python" --no-deps --reinstall-package styletts2-voice-clone "$HERE"
   echo "::endgroup::"
 }
 

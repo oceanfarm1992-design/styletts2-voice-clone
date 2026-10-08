@@ -43,22 +43,43 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
+    # apt costs ~40 s per runner. ffmpeg comes as a static binary from PyPI in
+    # seconds instead; espeak-ng is only the last-resort fallback, so it
+    # installs in the background while the engines load and is usually done
+    # long before any fallback could need it. soundfile's wheel bundles
+    # libsndfile.
     - name: System packages
       shell: bash
+      env:
+        PYTHON: ${{ steps.py.outputs.python-path }}
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq ffmpeg espeak-ng libsndfile1 >/dev/null
+        if ! command -v ffmpeg >/dev/null; then
+          "$PYTHON" -m pip install -q imageio-ffmpeg
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$("$PYTHON" -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" "$HOME/.local/bin/ffmpeg"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        fi
+        command -v espeak-ng >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq espeak-ng) >/dev/null 2>&1 &
 
-    # Public model weights + uv's wheel cache. Never the private voice files.
+    # hashFiles() only reads files inside the workspace (and errors on some
+    # checkouts), but this action may live outside it, so hash here instead.
+    - name: Dependency hash
+      id: deps
+      shell: bash
+      run: echo "hash=$(cat "$GITHUB_ACTION_PATH"/requirements/*.txt "$GITHUB_ACTION_PATH/setup_engines.sh" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+    # Built engine venvs + public model weights, never the private voice files.
+    # Restoring the venvs saves ~1 min of installing per runner. The key pins
+    # the exact Python build (venvs point at it) and the engine list.
     - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
       with:
         path: |
-          ~/.cache/uv
+          ~/.voiceclone/venvs
+          ~/.voiceclone/applio
           ~/.cache/huggingface
           ~/nltk_data
-          ~/.voiceclone/applio
-        key: voiceclone-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles(format('{0}/requirements/*.txt', github.action_path), format('{0}/setup_engines.sh', github.action_path)) }}
-        restore-keys: voiceclone-${{ runner.os }}-py${{ inputs.python-version }}-
+        key: voiceclone-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ inputs.engines }}-${{ steps.deps.outputs.hash }}
+        restore-keys: voiceclone-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ inputs.engines }}-
 
     - name: Build engine venvs
       shell: bash

@@ -15,10 +15,26 @@ from pathlib import Path
 SENTENCE_END = re.compile(r"(?<=[.!?।])\s+|\n+")
 JOIN_SAMPLE_RATE = 44100
 JOIN_GAP_SECONDS = 0.3
+# GitHub Free allows 20 concurrent jobs per account; more parts would only queue.
+MAX_PARTS = 20
+# Each runner pays ~2 min of setup + model load, so a part shorter than this
+# (~3 s of speech) costs more than it saves; tiny sentences get grouped.
+MIN_CHARS_PER_PART = 40
 
 
 def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in SENTENCE_END.split(text) if s.strip()]
+
+
+def auto_parts(text: str, max_parts: int = MAX_PARTS,
+               min_chars: int = MIN_CHARS_PER_PART) -> int:
+    """Runners for this script: one per sentence, but no part shorter than
+    `min_chars` and never more than `max_parts`."""
+    sentences = split_sentences(text)
+    if not sentences:
+        return 1
+    by_length = sum(len(s) for s in sentences) // min_chars
+    return max(1, min(max_parts, len(sentences), by_length))
 
 
 def split_script(text: str, parts: int) -> list[str]:
@@ -72,10 +88,14 @@ def split_main() -> None:
     ap = argparse.ArgumentParser(prog="voiceclone-split",
                                  description="Split a script into sentence-aligned parts.")
     ap.add_argument("--script", required=True)
-    ap.add_argument("--parts", type=int, required=True)
+    ap.add_argument("--parts", type=int, default=0,
+                    help="Number of parts; 0 = auto (one per sentence, see auto_parts).")
+    ap.add_argument("--max-parts", type=int, default=MAX_PARTS)
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
-    pieces = split_script(Path(args.script).read_text(encoding="utf-8"), args.parts)
+    text = Path(args.script).read_text(encoding="utf-8")
+    parts = args.parts if args.parts > 0 else auto_parts(text, args.max_parts)
+    pieces = split_script(text, min(parts, args.max_parts))
     if not pieces:
         sys.exit(f"{args.script} has no text.")
     out_dir = Path(args.out_dir)
