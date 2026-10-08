@@ -1,0 +1,88 @@
+name: voice
+
+# Unit tests on every push; a real CPU narration on demand (and weekly, so a
+# broken upstream dependency shows up here before it breaks a video pipeline).
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      language:
+        description: "en or ta"
+        default: ta
+      style:
+        description: "Profile style (default, comedy, ...)"
+        default: comedy
+      text:
+        description: "Text to narrate (empty = built-in sample for the language)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q ".[test]" && pytest -q
+
+  narrate:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ github.event_name == 'schedule' && fromJSON('["en","ta"]') || fromJSON(format('["{0}"]', inputs.language)) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+
+      - name: Write script
+        env:
+          TEXT: ${{ inputs.text }}
+          LANG_IN: ${{ matrix.language }}
+        run: |
+          mkdir -p build
+          if [ -n "$TEXT" ]; then printf '%s\n' "$TEXT" > build/script.txt
+          elif [ "$LANG_IN" = ta ]; then
+            echo "அனைவருக்கும் வணக்கம்! இன்று ஒரு குட்டி குரங்கு செய்த சேட்டையைப் பார்க்கப் போகிறோம். அவன் வாழைப்பழத்தை எடுத்துக்கொண்டு ஓடிவிட்டான்!" > build/script.txt
+          else
+            echo "Hello everyone! Today we are watching a tiny monkey who stole a banana and ran off like a professional thief." > build/script.txt
+          fi
+
+      - name: Narrate
+        id: voice
+        uses: ./
+        with:
+          script: build/script.txt
+          out: build/voice-${{ matrix.language }}.wav
+          language: ${{ matrix.language }}
+          style: ${{ inputs.style || 'comedy' }}
+          voice-ref-repo: ${{ vars.VOICE_REF_REPO }}
+          voice-repo-pat: ${{ secrets.VOICE_REPO_PAT }}
+          hf-token: ${{ secrets.HF_TOKEN }}
+
+      - name: Report
+        env:
+          ENGINE: ${{ steps.voice.outputs.engine }}
+        run: |
+          echo "### ${{ matrix.language }}: engine \`$ENGINE\`" >> "$GITHUB_STEP_SUMMARY"
+          # The schedule run is a health check: the cloned voice must have been used.
+          case "$ENGINE" in styletts2*|indicf5*) ;; *) [ "${{ github.event_name }}" != schedule ] || exit 1 ;; esac
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: voice-${{ matrix.language }}-${{ github.run_id }}
+          path: build/voice-*.wav
+          retention-days: 7

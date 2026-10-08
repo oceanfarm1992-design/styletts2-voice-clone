@@ -1,0 +1,33 @@
+name: narrate-test
+
+# Manual end-to-end check of the reusable parallel `narrate` workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: Script to narrate
+        required: true
+      language:
+        description: "en or ta"
+        default: ta
+      style:
+        description: "Profile style (default, comedy, ...)"
+        default: comedy
+      parts:
+        description: Parallel runners
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  voice:
+    uses: ./.github/workflows/narrate.yml
+    with:
+      text: ${{ inputs.text }}
+      language: ${{ inputs.language }}
+      style: ${{ inputs.style }}
+      parts: ${{ fromJSON(inputs.parts) }}
+      voice-ref-repo: ${{ vars.VOICE_REF_REPO }}
+      artifact-name: voice-${{ inputs.language }}-${{ github.run_id }}
+    secrets: inherit

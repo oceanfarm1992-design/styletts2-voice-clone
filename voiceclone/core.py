@@ -1,48 +1,42 @@
 """
-Reusable StyleTTS2 voice-cloning TTS chain, with Kokoro-82M, Piper, and
-espeak-ng fallbacks. Designed to run inside a CI job (e.g. a GitHub Actions
-Ubuntu runner, CPU-only) as part of an automated video pipeline.
+One voice engine for every video pipeline: speaks English and Tamil in a
+cloned voice, on CPU, inside a CI job (built for GitHub Actions).
 
-engine="auto" tries, in order:
-  1. styletts2 - clones a voice from a reference sample fetched at runtime
-     from a private GitHub repo (never bundled with this package or written
-     to disk anywhere persistent). Needs a fine-grained, read-only GitHub PAT
-     and the target repo path — see synthesize()'s voice_ref_repo /
-     voice_repo_pat_env arguments.
-  2. kokoro - open-weights neural TTS (hexgrad/Kokoro-82M), fully offline
-     once its checkpoint is cached, not your voice.
-  3. piper - fully-offline neural TTS, voice models cached locally, not your
-     voice.
-  4. espeak-ng - last resort; must be installed separately (e.g.
-     `apt-get install espeak-ng` on Ubuntu). Worst quality, always available.
+Two stages:
+  1. Base speech, first engine in the language's chain that succeeds:
+       en: styletts2 -> kokoro -> piper -> edge -> espeak
+       ta: indicf5   -> edge   -> espeak
+     styletts2 and indicf5 clone the voice (and speaking style) from reference
+     clips; the rest are fixed stock voices.
+  2. RVC voice conversion with a model trained on your own voice (on a local
+     GPU, see README), so even a stock-voice fallback comes out in your voice.
 
-engine="openai" is also available for manual/one-off use (needs
-OPENAI_API_KEY and the `openai` package) but isn't part of the "auto" chain
-since it isn't a clone of your own voice.
-
-Every per-engine function raises on failure; synthesize() catches that and
-tries the next engine in the chain, so a single dependency/secret/network
-problem never has to take down an otherwise-automated pipeline.
+Reference clips, the RVC model and profile.json (see profile.py) are fetched
+at runtime from a separate private repo. Heavy engines run as long-lived
+workers in their own virtualenvs (see pool.py). Every engine raises on
+failure; synthesize() moves to the next one, so a missing secret or a flaky
+download never takes down an otherwise-automated pipeline.
 """
-import functools
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 import requests
 
-OPENAI_AVAILABLE = False
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    pass
+from . import pool
+from .profile import Profile, ProfileError, VoiceSource
 
-_KOKORO_PIPELINE = None
-_KOKORO_LANG = None
-_STYLETTS2_MODEL = None
-_VOICE_REF_PATHS: dict = {}   # (repo, file) -> local cached path
-_STYLE_VECTORS: dict = {}     # (voice path, style path) -> spliced style tensor
+LANGUAGE_CHAINS = {
+    "en": ["styletts2", "kokoro", "piper", "edge", "espeak"],
+    "ta": ["indicf5", "edge", "espeak"],
+}
+CLONING_ENGINES = {"styletts2", "indicf5"}
+ALL_ENGINES = sorted({e for chain in LANGUAGE_CHAINS.values() for e in chain} | {"openai"})
+
+EDGE_VOICES = {"en": "en-US-GuyNeural", "ta": "ta-LK-KumarNeural"}
+ESPEAK_VOICES = {"en": "en-us+m3", "ta": "ta"}
 
 # HuggingFace raw file base for piper voices.
 # Path layout: <lang>/<lang_region>/<name>/<quality>/<voice>.onnx[.json]
@@ -52,172 +46,49 @@ VOICE_PATHS = {
     "en_US-amy-medium": "en/en_US/amy/medium/en_US-amy-medium.onnx",
     "en_US-ryan-high": "en/en_US/ryan/high/en_US-ryan-high.onnx",
 }
-HEADERS = {"User-Agent": "styletts2-voice-clone/0.1"}
+HEADERS = {"User-Agent": "styletts2-voice-clone/0.3"}
 
-# StyleTTS2's own long-text splitter chunks at 420 raw characters by default, but
-# ALL-CAPS emphasis / "..." pauses common in AI-written scripts can phonemize to
-# more tokens per character than that budget assumes, overflowing the underlying
-# model's 512-token limit even within one "safe" chunk. Shrink it for headroom.
-STYLETTS2_CHUNK_CHARS = 250
-
-# Phoneme-level pronunciation fixes, applied after StyleTTS2's own phonemizer.
-# "GitHub" phonemizes to ɡˈɪthʌb, and the model stretches that /h/ into a ~0.5s
-# near-silent breath ("Git ... Hub"); dropping it gives the fast spoken "Git-ub".
-PHONEME_FIXES = {
-    "ɡˈɪthʌb": "ɡˈɪtʌb",
-}
-
-
-class _FixedPhonemizer:
-    def __init__(self, inner):
-        self.inner = inner
-
-    def phonemize(self, text):
-        out = self.inner.phonemize(text)
-        for src, dst in PHONEME_FIXES.items():
-            out = out.replace(src, dst)
-        return out
+_SOURCES: dict = {}
 
 
 class AllEnginesFailedError(RuntimeError):
     """Raised by synthesize() only when every engine in the chain failed."""
 
 
-# --------------------------------------------------------------------------- OpenAI
-def run_openai(text: str, out_wav: str, model: str = "tts-1", voice: str = "onyx",
-                instructions: str | None = None) -> None:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-    if not OPENAI_AVAILABLE:
-        raise RuntimeError("openai package not installed.")
-
-    client = OpenAI(api_key=api_key)
-    kwargs = dict(model=model, voice=voice, input=text, response_format="wav")
-    if instructions:
-        kwargs["instructions"] = instructions
-    with client.audio.speech.with_streaming_response.create(**kwargs) as response:
-        response.stream_to_file(out_wav)
+def _log(msg: str) -> None:
+    print(f"[voiceclone] {msg}", file=sys.stderr)
 
 
-# ---------------------------------------------------------------------------- Kokoro
-def _get_kokoro_pipeline(lang_code: str):
-    global _KOKORO_PIPELINE, _KOKORO_LANG
-    if _KOKORO_PIPELINE is None or _KOKORO_LANG != lang_code:
-        from kokoro import KPipeline
-        _KOKORO_PIPELINE = KPipeline(lang_code=lang_code)
-        _KOKORO_LANG = lang_code
-    return _KOKORO_PIPELINE
+# ---------------------------------------------------------------- cloning engines
+def run_styletts2(text: str, out_wav: str, source: VoiceSource, settings: dict) -> None:
+    if not settings.get("voice"):
+        raise ProfileError("No English voice reference in the profile.")
+    style = settings.get("style")
+    pool.worker("styletts2").request({
+        "text": text, "out_wav": os.path.abspath(out_wav),
+        "voice_path": source.fetch(settings["voice"]),
+        "style_path": source.fetch(style) if style else None,
+        "alpha": settings.get("alpha", 0.3), "beta": settings.get("beta"),
+        "embedding_scale": settings.get("embedding_scale", 1.0),
+    })
 
 
+def run_indicf5(text: str, out_wav: str, source: VoiceSource, settings: dict) -> None:
+    if not (settings.get("ref_audio") and settings.get("ref_text")):
+        raise ProfileError("IndicF5 needs 'ref_audio' and its exact 'ref_text' in the profile.")
+    pool.worker("indicf5").request({
+        "text": text, "out_wav": os.path.abspath(out_wav),
+        "ref_audio": source.fetch(settings["ref_audio"]), "ref_text": settings["ref_text"],
+        "nfe_step": settings.get("nfe_step"), "speed": settings.get("speed"),
+    })
+
+
+# ------------------------------------------------------------ stock-voice engines
 def run_kokoro(text: str, out_wav: str, voice: str = "am_fenrir", lang_code: str = "a") -> None:
-    import numpy as np
-    import soundfile as sf
-
-    pipeline = _get_kokoro_pipeline(lang_code)
-    chunks = [audio for _, _, audio in pipeline(text, voice=voice)]
-    full = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-    sf.write(out_wav, full, 24000)
+    pool.worker("kokoro").request({"text": text, "out_wav": os.path.abspath(out_wav),
+                                   "voice": voice, "lang_code": lang_code})
 
 
-# ------------------------------------------------------------------------- StyleTTS2
-def _fetch_voice_reference(repo: str, file: str, pat: str, cache_path: str) -> str:
-    """Download the private reference voice clip at runtime via a fine-grained,
-    read-only PAT scoped to a separate private repo. Never committed anywhere —
-    the clip is personal biometric-ish data and this package is public."""
-    cached = _VOICE_REF_PATHS.get((repo, file))
-    if cached and os.path.exists(cached):
-        return cached
-    if not repo:
-        raise RuntimeError(
-            "No voice reference repo configured (pass voice_ref_repo= or set VOICE_REF_REPO)."
-        )
-    if not pat:
-        raise RuntimeError(
-            "No PAT available to fetch the voice reference sample "
-            "(set the env var named by voice_repo_pat_env)."
-        )
-    url = f"https://api.github.com/repos/{repo}/contents/{file}"
-    headers = {"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github.raw+json"}
-    resp = requests.get(url, headers=headers, timeout=60)
-    resp.raise_for_status()
-    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-    with open(cache_path, "wb") as f:
-        f.write(resp.content)
-    _VOICE_REF_PATHS[(repo, file)] = cache_path
-    return cache_path
-
-
-def _get_styletts2_model():
-    global _STYLETTS2_MODEL
-    if _STYLETTS2_MODEL is None:
-        import nltk
-        import torch
-
-        # styletts2's TextCleaner debug-prints raw phoneme text (including rare IPA
-        # characters) on any symbol outside its vocabulary — harmless on Linux CI
-        # (UTF-8 locale) but crashes on Windows consoles (cp1252). Widen stdout
-        # defensively so local runs behave the same as CI.
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-        # styletts2's bundled checkpoint loader calls torch.load() without
-        # weights_only=False. PyTorch >=2.6 defaults weights_only=True, which
-        # rejects this (older, trusted, official StyleTTS2/LibriTTS) checkpoint
-        # format. Patch the default rather than editing the installed package.
-        torch.load = functools.partial(torch.load, weights_only=False)
-        nltk.download("punkt_tab", quiet=True)
-
-        import styletts2.tts as _styletts2_tts
-        _styletts2_tts.SINGLE_INFERENCE_MAX_LEN = STYLETTS2_CHUNK_CHARS
-
-        from styletts2.tts import StyleTTS2
-        _STYLETTS2_MODEL = StyleTTS2()
-        _STYLETTS2_MODEL.phoneme_converter = _FixedPhonemizer(_STYLETTS2_MODEL.phoneme_converter)
-    return _STYLETTS2_MODEL
-
-
-def _style_vector(model, voice_path: str, style_path: str | None):
-    """StyleTTS2's 256-dim style vector is [timbre (128) | prosody (128)]:
-    style_encoder -> who it sounds like, predictor_encoder -> how it is spoken
-    (pacing, intonation, energy). With a separate style clip, keep the timbre of
-    the voice sample and take the prosody from the style clip."""
-    key = (voice_path, style_path)
-    if key not in _STYLE_VECTORS:
-        voice = model.compute_style(voice_path)
-        if style_path:
-            import torch
-            style = model.compute_style(style_path)
-            voice = torch.cat([voice[:, :128], style[:, 128:]], dim=1)
-        _STYLE_VECTORS[key] = voice
-    return _STYLE_VECTORS[key]
-
-
-def run_styletts2(text: str, out_wav: str, voice_ref_repo: str | None,
-                   voice_ref_file: str = "reference_voice.mp3",
-                   pat_env: str = "VOICE_REPO_PAT",
-                   cache_path: str = "build/.voice_reference.mp3",
-                   style_ref_file: str | None = None,
-                   alpha: float = 0.3,
-                   beta: float | None = None,
-                   embedding_scale: float = 1.0) -> None:
-    """beta = how much prosody the model invents from the text (1) vs. copies from
-    the reference (0). Defaults to StyleTTS2's 0.7, or 0.0 when a style clip is
-    given so its speaking style comes through fully."""
-    pat = os.environ.get(pat_env, "").strip()
-    ref_path = _fetch_voice_reference(voice_ref_repo, voice_ref_file, pat, cache_path)
-    style_path = None
-    if style_ref_file:
-        root, _ = os.path.splitext(cache_path)
-        style_cache = f"{root}.style{os.path.splitext(style_ref_file)[1] or '.wav'}"
-        style_path = _fetch_voice_reference(voice_ref_repo, style_ref_file, pat, style_cache)
-    if beta is None:
-        beta = 0.0 if style_path else 0.7
-    model = _get_styletts2_model()
-    model.inference(text, output_wav_file=out_wav, ref_s=_style_vector(model, ref_path, style_path),
-                    alpha=alpha, beta=beta, embedding_scale=embedding_scale)
-
-
-# ----------------------------------------------------------------------------- Piper
 def _download(url: str, dest: str) -> None:
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         return
@@ -251,7 +122,25 @@ def run_piper(text: str, out_wav: str, voice: str = "en_US-amy-medium",
         raise RuntimeError(f"piper failed: {proc.stderr.decode('utf-8', 'replace')}")
 
 
-# ---------------------------------------------------------------------------- espeak
+def _to_wav(src: str, out_wav: str) -> None:
+    proc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, out_wav],
+                          capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', 'replace')}")
+
+
+def run_edge(text: str, out_wav: str, voice: str, rate: str = "+0%", pitch: str = "+0Hz") -> None:
+    """Microsoft Edge online neural TTS (needs network, no key)."""
+    import asyncio
+
+    import edge_tts
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mp3 = os.path.join(tmp, "edge.mp3")
+        asyncio.run(edge_tts.Communicate(text, voice, rate=rate, pitch=pitch).save(mp3))
+        _to_wav(mp3, out_wav)
+
+
 def run_espeak(text: str, out_wav: str, voice: str = "en-us+m3", speed: int = 135,
                pitch: int = 45, gap: int = 6) -> None:
     cmd = ["espeak-ng", "-v", voice, "-s", str(speed), "-p", str(pitch), "-g", str(gap),
@@ -261,66 +150,165 @@ def run_espeak(text: str, out_wav: str, voice: str = "en-us+m3", speed: int = 13
         raise RuntimeError(f"espeak-ng failed: {proc.stderr.decode('utf-8', 'replace')}")
 
 
-# ------------------------------------------------------------------------------ main
+def run_openai(text: str, out_wav: str, model: str = "tts-1", voice: str = "onyx",
+               instructions: str | None = None) -> None:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    from openai import OpenAI
+
+    kwargs = dict(model=model, voice=voice, input=text, response_format="wav")
+    if instructions:
+        kwargs["instructions"] = instructions
+    with OpenAI(api_key=api_key).audio.speech.with_streaming_response.create(**kwargs) as response:
+        response.stream_to_file(out_wav)
+
+
+# --------------------------------------------------------------------------- RVC
+def run_rvc(in_wav: str, out_wav: str, source: VoiceSource, profile: Profile) -> None:
+    rvc = profile.rvc
+    if rvc is None:
+        raise ProfileError("No 'rvc' model in the profile.")
+    pool.worker("rvc").request({
+        "in_wav": os.path.abspath(in_wav), "out_wav": os.path.abspath(out_wav),
+        "model_path": source.fetch(rvc.model), "index_path": source.fetch(rvc.index),
+        "pitch": rvc.pitch, "index_rate": rvc.index_rate, "protect": rvc.protect,
+        "f0_method": "rmvpe",
+    })
+
+
+# -------------------------------------------------------------------------- main
+def _source(repo: str | None, pat_env: str, cache_dir: str) -> VoiceSource:
+    key = (repo, pat_env, cache_dir, os.environ.get("VOICE_REF_DIR"))
+    if key not in _SOURCES:
+        _SOURCES[key] = VoiceSource.from_env(repo, pat_env, cache_dir)
+    return _SOURCES[key]
+
+
+def _load_profile(source: VoiceSource, voice_ref_file: str, style_ref_file: str | None) -> Profile:
+    try:
+        return source.profile(voice_ref_file, style_ref_file)
+    except ProfileError as exc:
+        _log(f"voice profile unavailable ({exc}); only stock voices will work")
+        return Profile()
+
+
+def _has_audio(path: str) -> bool:
+    return os.path.exists(path) and os.path.getsize(path) > 0
+
+
 def synthesize(
     text: str,
     out_wav: str,
     engine: str = "auto",
+    language: str = "en",
+    style: str = "default",
+    rvc: str = "auto",
     voice_ref_repo: str | None = None,
     voice_ref_file: str = "reference_voice.mp3",
     voice_repo_pat_env: str = "VOICE_REPO_PAT",
     voice_ref_cache: str = "build/.voice_reference.mp3",
     style_ref_file: str | None = None,
-    styletts2_alpha: float = 0.3,
+    styletts2_alpha: float | None = None,
     styletts2_beta: float | None = None,
-    styletts2_embedding_scale: float = 1.0,
+    styletts2_embedding_scale: float | None = None,
     kokoro_voice: str = "am_fenrir",
     kokoro_lang: str = "a",
     piper_voice: str = "en_US-amy-medium",
+    edge_voice: str | None = None,
     voices_dir: str = "voices",
     openai_model: str = "tts-1",
     openai_voice: str = "onyx",
     openai_instructions: str | None = None,
 ) -> str:
-    """Synthesize `text` to `out_wav`.
+    """Synthesize `text` (in `language`, "en" or "ta") to `out_wav`.
 
-    Returns the name of the engine that actually produced the audio.
+    Returns what produced the audio, e.g. "styletts2+rvc" or "edge+rvc".
 
-    engine="auto" (the default) tries styletts2 -> kokoro -> piper -> espeak,
-    moving to the next engine on any failure (missing secret, network error,
-    missing binary, etc). Pass a specific engine name to skip the chain and
-    use only that one. Raises AllEnginesFailedError only when every engine
-    tried has failed.
+    engine="auto" walks the language's chain (see LANGUAGE_CHAINS), moving on
+    at any failure; a specific engine name runs only that one. style picks a
+    style block from the voice profile ("default", "comedy", ...).
 
-    style_ref_file (styletts2 only): a second clip in voice_ref_repo whose
-    speaking style (pacing, intonation, energy) is applied to the cloned voice;
-    the timbre still comes from voice_ref_file.
+    rvc: "auto" converts the result with the profile's RVC model when there is
+    one and keeps the unconverted audio if conversion fails; "on" treats a
+    conversion failure as that engine failing; "off" skips it.
+
+    style_ref_file / styletts2_* override the profile's English settings
+    (kept for callers written against 0.2). Raises AllEnginesFailedError only
+    when every engine tried has failed.
     """
-    engines = [engine] if engine != "auto" else ["styletts2", "kokoro", "piper", "espeak"]
+    if language not in LANGUAGE_CHAINS:
+        raise ValueError(f"Unsupported language '{language}'. Known: {list(LANGUAGE_CHAINS)}")
+    if rvc not in ("auto", "on", "off"):
+        raise ValueError("rvc must be 'auto', 'on' or 'off'")
+    engines = LANGUAGE_CHAINS[language] if engine == "auto" else [engine]
     os.makedirs(os.path.dirname(out_wav) or ".", exist_ok=True)
 
+    source = _source(voice_ref_repo, voice_repo_pat_env,
+                     os.path.join(os.path.dirname(voice_ref_cache) or ".", ".voice_refs"))
+    profile = _load_profile(source, voice_ref_file, style_ref_file)
+    settings = profile.style_for(style, language)
+    overrides = {"style": style_ref_file, "alpha": styletts2_alpha, "beta": styletts2_beta,
+                 "embedding_scale": styletts2_embedding_scale}
+    if language == "en":
+        settings.update({k: v for k, v in overrides.items() if v is not None})
+        settings.setdefault("voice", voice_ref_file)
+
+    use_rvc = rvc != "off" and profile.rvc is not None
+    if rvc == "on" and profile.rvc is None:
+        raise AllEnginesFailedError("rvc='on' but the voice profile has no RVC model.")
+
     last_error: Exception | None = None
-    for eng in engines:
-        try:
-            if eng == "styletts2":
-                run_styletts2(text, out_wav, voice_ref_repo, voice_ref_file,
-                              voice_repo_pat_env, voice_ref_cache, style_ref_file,
-                              styletts2_alpha, styletts2_beta, styletts2_embedding_scale)
-            elif eng == "kokoro":
-                run_kokoro(text, out_wav, kokoro_voice, kokoro_lang)
-            elif eng == "piper":
-                run_piper(text, out_wav, piper_voice, voices_dir)
-            elif eng == "espeak":
-                run_espeak(text, out_wav)
-            elif eng == "openai":
-                run_openai(text, out_wav, openai_model, openai_voice, openai_instructions)
-            else:
-                raise ValueError(f"Unknown engine '{eng}'")
-
-            if os.path.exists(out_wav) and os.path.getsize(out_wav) > 0:
-                return eng
-        except Exception as exc:  # noqa: BLE001 — try the next engine
-            last_error = exc
-            print(f"[voiceclone] {eng} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-
+    with tempfile.TemporaryDirectory() as tmp:
+        base_wav = os.path.join(tmp, "base.wav") if use_rvc else out_wav
+        for eng in engines:
+            try:
+                _run_base(eng, text, base_wav, language, source, settings, kokoro_voice,
+                          kokoro_lang, piper_voice, edge_voice, voices_dir,
+                          openai_model, openai_voice, openai_instructions)
+                if not _has_audio(base_wav):
+                    raise RuntimeError("engine finished without writing audio")
+                if not use_rvc:
+                    return eng
+                return eng + _convert(base_wav, out_wav, source, profile, strict=rvc == "on")
+            except Exception as exc:  # noqa: BLE001 - try the next engine
+                last_error = exc
+                _log(f"{eng} failed: {type(exc).__name__}: {exc}")
     raise AllEnginesFailedError(f"All TTS engines failed. Last error: {last_error}")
+
+
+def _convert(base_wav: str, out_wav: str, source: VoiceSource, profile: Profile,
+             strict: bool) -> str:
+    """RVC-convert base_wav into out_wav; returns the engine-name suffix."""
+    try:
+        run_rvc(base_wav, out_wav, source, profile)
+        if _has_audio(out_wav):
+            return "+rvc"
+        raise RuntimeError("RVC finished without writing audio")
+    except Exception as exc:  # noqa: BLE001 - keep the unconverted audio unless strict
+        if strict:
+            raise
+        _log(f"rvc failed, keeping unconverted audio: {type(exc).__name__}: {exc}")
+        shutil.copyfile(base_wav, out_wav)
+        return ""
+
+
+def _run_base(eng, text, out_wav, language, source, settings, kokoro_voice, kokoro_lang,
+              piper_voice, edge_voice, voices_dir, openai_model, openai_voice,
+              openai_instructions) -> None:
+    if eng == "styletts2":
+        run_styletts2(text, out_wav, source, settings)
+    elif eng == "indicf5":
+        run_indicf5(text, out_wav, source, settings)
+    elif eng == "kokoro":
+        run_kokoro(text, out_wav, kokoro_voice, kokoro_lang)
+    elif eng == "piper":
+        run_piper(text, out_wav, piper_voice, voices_dir)
+    elif eng == "edge":
+        run_edge(text, out_wav, edge_voice or EDGE_VOICES[language])
+    elif eng == "espeak":
+        run_espeak(text, out_wav, ESPEAK_VOICES[language])
+    elif eng == "openai":
+        run_openai(text, out_wav, openai_model, openai_voice, openai_instructions)
+    else:
+        raise ValueError(f"Unknown engine '{eng}'")

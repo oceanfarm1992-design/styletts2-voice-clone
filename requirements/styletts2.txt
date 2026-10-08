@@ -1,0 +1,5 @@
+# StyleTTS2 worker venv (English cloning).
+torch==2.8.0
+torchaudio==2.8.0
+styletts2==0.1.6
+nltk>=3.8.1
