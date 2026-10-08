@@ -49,16 +49,18 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq ffmpeg espeak-ng libsndfile1 >/dev/null
 
-    # Public model weights + uv's wheel cache. Never the private voice files.
+    # Built engine venvs + public model weights, never the private voice files.
+    # Restoring the venvs saves ~1 min of installing per runner. The key pins
+    # the exact Python build (venvs point at it) and the engine list.
     - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
       with:
         path: |
-          ~/.cache/uv
+          ~/.voiceclone/venvs
+          ~/.voiceclone/applio
           ~/.cache/huggingface
           ~/nltk_data
-          ~/.voiceclone/applio
-        key: voiceclone-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles(format('{0}/requirements/*.txt', github.action_path), format('{0}/setup_engines.sh', github.action_path)) }}
-        restore-keys: voiceclone-${{ runner.os }}-py${{ inputs.python-version }}-
+        key: voiceclone-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ inputs.engines }}-${{ hashFiles(format('{0}/requirements/*.txt', github.action_path), format('{0}/setup_engines.sh', github.action_path)) }}
+        restore-keys: voiceclone-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ inputs.engines }}-
 
     - name: Build engine venvs
       shell: bash

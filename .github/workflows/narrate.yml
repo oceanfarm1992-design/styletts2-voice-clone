@@ -1,16 +1,17 @@
 name: narrate
 
 # Reusable workflow: narrate a script in the cloned voice, split across several
-# runners in parallel (IndicF5 needs minutes per sentence on CPU, so a Tamil
-# script on 4 runners finishes ~4x sooner). The joined WAV is uploaded as an
-# artifact; download it in a later job of the caller with
+# runners in parallel (IndicF5 needs minutes per sentence on CPU). By default
+# the number of runners follows the script: one per sentence, tiny sentences
+# grouped, at most `max-parts` (GitHub Free runs 20 jobs at once). The joined
+# WAV is uploaded as an artifact; download it in a later job of the caller with
 # actions/download-artifact and `name: <artifact-name input>`.
 #
 #   jobs:
 #     voice:
 #       uses: oceanfarm1992-design/styletts2-voice-clone/.github/workflows/narrate.yml@main
-#       with: {text: "...", language: ta, style: comedy, parts: 4, artifact-name: voiceover}
-#       secrets: inherit   # needs VOICE_REPO_PAT and HF_TOKEN
+#       with: {text: "...", language: ta, style: comedy, artifact-name: voiceover}
+#       secrets: inherit   # needs VOICE_REPO_PAT
 on:
   workflow_call:
     inputs:
@@ -27,9 +28,13 @@ on:
         type: string
         default: default
       parts:
-        description: Number of parallel runners (sentence-aligned split)
+        description: Parallel runners; 0 = auto (one per sentence, up to max-parts)
         type: number
-        default: 4
+        default: 0
+      max-parts:
+        description: Upper limit for parallel runners
+        type: number
+        default: 20
       voice-ref-repo:
         description: owner/repo of the private voice reference repo
         type: string
@@ -51,8 +56,11 @@ on:
 permissions:
   contents: read
 
+# Every job uses the engine at the exact commit of this workflow file, so one
+# run never mixes versions and a branch can be tested before it is merged.
 env:
-  ENGINE_PKG: git+https://github.com/oceanfarm1992-design/styletts2-voice-clone.git@main
+  ENGINE_REPO: oceanfarm1992-design/styletts2-voice-clone
+  ENGINE_SHA: ${{ github.job_workflow_sha }}
 
 jobs:
   split:
@@ -67,11 +75,14 @@ jobs:
         env:
           TEXT: ${{ inputs.text }}
           PARTS: ${{ inputs.parts }}
+          MAX_PARTS: ${{ inputs.max-parts }}
         run: |
-          pip install -q "$ENGINE_PKG"
+          pip install -q "git+https://github.com/$ENGINE_REPO.git@$ENGINE_SHA"
           mkdir -p parts
           printf '%s\n' "$TEXT" > script.txt
-          echo "parts=$(voiceclone-split --script script.txt --parts "$PARTS" --out-dir parts)" >> "$GITHUB_OUTPUT"
+          parts=$(voiceclone-split --script script.txt --parts "$PARTS" --max-parts "$MAX_PARTS" --out-dir parts)
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
+          echo "Narrating on $(ls parts | wc -l) runner(s), engine $ENGINE_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ${{ inputs.artifact-name }}-script-parts
@@ -91,9 +102,15 @@ jobs:
         with:
           name: ${{ inputs.artifact-name }}-script-parts
           path: parts
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_SHA }}
+          path: .voiceclone-engine
+          persist-credentials: false
       - name: Narrate ${{ matrix.part }}
         id: voice
-        uses: oceanfarm1992-design/styletts2-voice-clone@main
+        uses: ./.voiceclone-engine
         with:
           engines: ${{ inputs.language == 'ta' && 'indicf5 rvc' || 'styletts2 rvc' }}
           script: parts/${{ matrix.part }}.txt
@@ -128,8 +145,8 @@ jobs:
           path: out
       - id: join
         run: |
-          sudo apt-get install -y -qq ffmpeg >/dev/null
-          pip install -q "$ENGINE_PKG"
+          command -v ffmpeg >/dev/null || sudo apt-get install -y -qq ffmpeg >/dev/null
+          pip install -q "git+https://github.com/$ENGINE_REPO.git@$ENGINE_SHA"
           mapfile -t wavs < <(ls out/part_*.wav | sort)
           voiceclone-join --out voice.wav "${wavs[@]}"
           echo "engines=$(cat $(ls out/part_*.engine | sort) | tr '\n' ' ')" >> "$GITHUB_OUTPUT"

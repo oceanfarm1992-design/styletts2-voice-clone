@@ -14,8 +14,8 @@ on:
         description: "Profile style (default, comedy, ...)"
         default: comedy
       parts:
-        description: Parallel runners
-        default: "4"
+        description: Parallel runners (0 = auto, one per sentence)
+        default: "0"
 
 permissions:
   contents: read

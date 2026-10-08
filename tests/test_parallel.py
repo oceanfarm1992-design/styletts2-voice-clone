@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from voiceclone.parallel import join_wavs, split_script, split_sentences
+from voiceclone.parallel import auto_parts, join_wavs, split_script, split_sentences
 
 TEXT = "ஒன்று. இரண்டு! மூன்று?\nநான்கு। Five is here. Six."
 
@@ -51,3 +51,22 @@ def test_join_wavs_concatenates_with_gaps(tmp_path):
     probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                             "-of", "csv=p=0", str(out)], capture_output=True, text=True)
     assert abs(float(probe.stdout) - 2.5) < 0.05
+
+
+def test_auto_parts_one_runner_per_sentence():
+    text = " ".join(f"This is sentence number {i} of the funny story." for i in range(8))
+    assert auto_parts(text) == 8
+
+
+def test_auto_parts_groups_tiny_sentences():
+    assert auto_parts("Hi. Yes. No. Ok. Go. Run. Stop. Now.") == 1
+
+
+def test_auto_parts_capped_for_long_scripts():
+    text = " ".join(f"This is sentence number {i} of a long story." for i in range(100))
+    assert auto_parts(text) == 20
+    assert auto_parts(text, max_parts=5) == 5
+
+
+def test_auto_parts_empty_script():
+    assert auto_parts("  ") == 1

@@ -76,7 +76,8 @@ jobs:
       text: ${{ needs.script.outputs.text }}
       language: ta
       style: comedy
-      parts: 6                        # public repos get up to 20 parallel jobs
+      # parts: 0 (default) = automatic: one runner per sentence, short
+      # sentences grouped, at most max-parts (default 20 = GitHub Free limit)
       artifact-name: voiceover
     secrets: inherit                  # VOICE_REPO_PAT
   render:
