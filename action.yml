@@ -70,6 +70,31 @@ runs:
         bash "$GITHUB_ACTION_PATH/setup_engines.sh" "${engines[@]}"
         "$PYTHON" -m pip install -q "$GITHUB_ACTION_PATH"
 
+    # IndicF5 is gated on Hugging Face; a copy lives in a release of the private
+    # voice repo, so the read-only voice PAT is enough (no HF_TOKEN needed).
+    # Skipped when the cache above already restored it.
+    - name: Install IndicF5 from the private release
+      if: ${{ contains(inputs.engines, 'indicf5') && inputs.voice-repo-pat != '' && inputs.voice-ref-repo != '' }}
+      shell: bash
+      env:
+        PAT: ${{ inputs.voice-repo-pat }}
+        REPO: ${{ inputs.voice-ref-repo }}
+        TAG: indicf5-v1
+        ASSET: indicf5-hf-cache.tar
+      run: |
+        hub="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+        if [ -d "$hub/models--ai4bharat--IndicF5/snapshots" ]; then
+          echo "IndicF5 already in the HF cache"; exit 0
+        fi
+        api="https://api.github.com/repos/$REPO/releases"
+        id=$(curl -fsSL -H "Authorization: Bearer $PAT" "$api/tags/$TAG" \
+             | python3 -c "import json,sys; print(next(a['id'] for a in json.load(sys.stdin)['assets'] if a['name'] == '$ASSET'))") \
+          || { echo "::warning::No $ASSET in $REPO release $TAG; IndicF5 will need HF_TOKEN"; exit 0; }
+        mkdir -p "$hub"
+        curl -fsSL --retry 3 -H "Authorization: Bearer $PAT" -H "Accept: application/octet-stream" \
+          "$api/assets/$id" | tar -x -C "$hub"
+        echo "IndicF5 installed from $REPO release $TAG"
+
     - name: Narrate
       id: narrate
       if: ${{ inputs.script != '' }}

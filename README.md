@@ -39,7 +39,6 @@ data here.
     style: comedy                     # a style block from profile.json
     voice-ref-repo: ${{ vars.VOICE_REF_REPO }}
     voice-repo-pat: ${{ secrets.VOICE_REPO_PAT }}
-    hf-token: ${{ secrets.HF_TOKEN }} # Tamil (IndicF5) only
 - run: echo "made with ${{ steps.voice.outputs.engine }}"   # e.g. indicf5+rvc
 ```
 
@@ -79,7 +78,7 @@ jobs:
       style: comedy
       parts: 6                        # public repos get up to 20 parallel jobs
       artifact-name: voiceover
-    secrets: inherit                  # VOICE_REPO_PAT, HF_TOKEN
+    secrets: inherit                  # VOICE_REPO_PAT
   render:
     needs: voice
     runs-on: ubuntu-latest
@@ -94,7 +93,7 @@ jobs:
 |---|---|---|
 | `VOICE_REF_REPO` | variable | `oceanfarm1992-design/voice-reference-audio` |
 | `VOICE_REPO_PAT` | secret | Fine-grained PAT, **read-only** on that one private repo |
-| `HF_TOKEN` | secret | Hugging Face **read** token. The account must have accepted the terms at [ai4bharat/IndicF5](https://huggingface.co/ai4bharat/IndicF5) |
+| `HF_TOKEN` | secret | *Optional fallback.* The action installs IndicF5 from the private repo's `indicf5-v1` release (made once by its `mirror-indicf5` workflow), so the voice PAT is enough. Needed only if that release is missing. |
 
 ## The private voice repo
 

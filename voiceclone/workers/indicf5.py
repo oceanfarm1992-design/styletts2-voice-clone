@@ -3,9 +3,14 @@ copies both voice and speaking tone from a short reference clip.
 
 Request: {"text", "out_wav", "ref_audio", "ref_text", "nfe_step"?, "speed"?}
 
-The model (ai4bharat/IndicF5) is gated on Hugging Face: the HF_TOKEN env var
-must belong to an account that has accepted its terms.
+The model (ai4bharat/IndicF5) is gated on Hugging Face. The GitHub Action
+installs a copy from the private voice repo's release into the HF cache, and
+then no token is used at all; otherwise HF_TOKEN must belong to an account that
+has accepted the model's terms.
 """
+import os
+from pathlib import Path
+
 from ._serve import serve
 
 REPO_ID = "ai4bharat/IndicF5"
@@ -21,7 +26,20 @@ _MODEL = None
 _REFS: dict = {}  # (path, text) -> preprocessed (ref_audio, ref_text)
 
 
+def _hub_cache() -> Path:
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    hf_home = os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface"
+    return Path(hf_home) / "hub"
+
+
 def _load():
+    # When the model was pre-installed into the HF cache (the GitHub Action
+    # restores it from a private release), load it offline: no HF_TOKEN needed
+    # and no dependency on Hugging Face being up. Must be set before
+    # huggingface_hub is imported, since it reads the flag at import time.
+    if (_hub_cache() / f"models--{REPO_ID.replace('/', '--')}" / "snapshots").is_dir():
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
     from transformers import AutoModel
 
     model = AutoModel.from_pretrained(REPO_ID, trust_remote_code=True)
