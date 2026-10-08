@@ -74,7 +74,8 @@ jobs:
           B: ${{ github.workflow_sha }}
           C: ${{ github.workflow_ref }}
           D: ${{ toJSON(job) }}
-        run: printf 'job_workflow_sha=%s
+        run: |
+          echo "job_workflow_sha=$A"; echo "workflow_sha=$B"; echo "workflow_ref=$C"; echo "job=$D"
 workflow_sha=%s
 workflow_ref=%s
 job=%s
