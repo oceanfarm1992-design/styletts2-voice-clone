@@ -150,8 +150,10 @@ jobs:
           ENGINE_REPO: ${{ job.workflow_repository }}
           ENGINE_SHA: ${{ job.workflow_sha }}
         run: |
-          command -v ffmpeg >/dev/null || sudo apt-get install -y -qq ffmpeg >/dev/null
-          pip install -q "git+https://github.com/$ENGINE_REPO.git@$ENGINE_SHA"
+          pip install -q imageio-ffmpeg "git+https://github.com/$ENGINE_REPO.git@$ENGINE_SHA"
+          # static ffmpeg from PyPI: seconds, vs ~50 s for apt on this runner
+          mkdir -p ~/.local/bin && export PATH="$HOME/.local/bin:$PATH"
+          command -v ffmpeg >/dev/null || ln -sf "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" ~/.local/bin/ffmpeg
           mapfile -t wavs < <(ls out/part_*.wav | sort)
           voiceclone-join --out voice.wav "${wavs[@]}"
           echo "engines=$(cat $(ls out/part_*.engine | sort) | tr '\n' ' ')" >> "$GITHUB_OUTPUT"

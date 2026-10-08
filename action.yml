@@ -43,11 +43,23 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
+    # apt costs ~40 s per runner. ffmpeg comes as a static binary from PyPI in
+    # seconds instead; espeak-ng is only the last-resort fallback, so it
+    # installs in the background while the engines load and is usually done
+    # long before any fallback could need it. soundfile's wheel bundles
+    # libsndfile.
     - name: System packages
       shell: bash
+      env:
+        PYTHON: ${{ steps.py.outputs.python-path }}
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq ffmpeg espeak-ng libsndfile1 >/dev/null
+        if ! command -v ffmpeg >/dev/null; then
+          "$PYTHON" -m pip install -q imageio-ffmpeg
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$("$PYTHON" -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" "$HOME/.local/bin/ffmpeg"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        fi
+        command -v espeak-ng >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq espeak-ng) >/dev/null 2>&1 &
 
     # hashFiles() only reads files inside the workspace (and errors on some
     # checkouts), but this action may live outside it, so hash here instead.
