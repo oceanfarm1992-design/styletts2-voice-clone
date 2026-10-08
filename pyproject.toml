@@ -4,23 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "styletts2-voice-clone"
-version = "0.2.0"
-description = "Reusable StyleTTS2 voice-cloning TTS chain (Kokoro/Piper/espeak fallbacks) for CI-driven video pipelines"
+version = "0.3.0"
+description = "One cloned-voice TTS engine (English + Tamil, RVC-converted) for CI-driven video pipelines"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31.0",
+    "edge-tts>=7.0.0",
 ]
 
+# Heavy engines normally run in their own venvs, created by setup_engines.sh from
+# requirements/<engine>.txt (the GitHub Action does this). These extras install
+# an engine into the current environment instead, as in 0.2.
 [project.optional-dependencies]
 styletts2 = ["styletts2>=0.1.6", "torch>=2.1.2", "torchaudio>=2.1.2", "nltk>=3.8.1"]
 kokoro = ["kokoro>=0.9.4", "soundfile>=0.12.1", "numpy>=1.24.0"]
 openai = ["openai>=1.0.0"]
 all = ["styletts2-voice-clone[styletts2,kokoro,openai]"]
+test = ["pytest>=8.0"]
 
 [project.scripts]
 voiceclone = "voiceclone.cli:main"
+voiceclone-split = "voiceclone.parallel:split_main"
+voiceclone-join = "voiceclone.parallel:join_main"
 
 [tool.setuptools.packages.find]
 include = ["voiceclone*"]

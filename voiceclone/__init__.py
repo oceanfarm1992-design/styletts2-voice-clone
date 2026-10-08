@@ -1,3 +1,3 @@
-from .core import AllEnginesFailedError, synthesize
+from .core import LANGUAGE_CHAINS, AllEnginesFailedError, synthesize
 
-__all__ = ["synthesize", "AllEnginesFailedError"]
+__all__ = ["synthesize", "AllEnginesFailedError", "LANGUAGE_CHAINS"]

@@ -1,0 +1,6 @@
+# IndicF5 worker venv (Tamil). CPU torch comes from the PyTorch CPU index.
+torch==2.8.0
+torchaudio==2.8.0
+transformers==4.49.0
+soundfile>=0.12.1
+f5_tts @ git+https://github.com/ai4bharat/IndicF5.git@13f7c4d627cc10111aea8fe9c0039462cacacdc7

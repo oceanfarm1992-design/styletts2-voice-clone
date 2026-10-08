@@ -1,0 +1,18 @@
+# RVC worker venv: the subset of Applio's requirements its inference path imports.
+torch==2.8.0
+torchaudio==2.8.0
+numpy<2.3
+faiss-cpu==1.14.3
+librosa==0.11.0
+scipy
+soundfile
+soxr
+noisereduce==3.0.3
+pedalboard
+torchcrepe==0.0.24
+torchfcpe==0.0.4
+einops
+transformers>=4.44,<5
+wget
+requests
+local-attention
