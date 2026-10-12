@@ -7,3 +7,14 @@ voices/
 .venv/
 *.wav
 *.mp3
+*.m4a
+*.flac
+*.ogg
+*.opus
+*.aac
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.index
+voice_clone_pipeline_setup.md
